@@ -55,17 +55,36 @@ class RNNPredictorNode(Node):
         self.create_subscription(Twist, '/cmd_vel', self.cmd_callback, 10)
         self.pred_pub = self.create_publisher(PoseStamped, '/predicted_pose', 10)
 
-        # Load scaler and model using absolute paths
-        base_path = os.path.expanduser('~/ros2_ws')  # adjust if different
-        scaler_path = os.path.join(base_path, 'scaler.pkl')
-        model_path = os.path.join(base_path, 'encoder_decoder_model.pt')
+        # Load scaler and model using correct paths
+        try:
+            # Find the repository root directory
+            current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            base_path = current_dir  # Use the root directory
+            self.get_logger().info(f"Looking for model files in: {base_path}")
 
-        with open(scaler_path, 'rb') as f:
-            self.scaler = pickle.load(f)
+            scaler_path = os.path.join(base_path, 'scaler.pkl')
+            model_path = os.path.join(base_path, 'encoder_decoder_model.pt')
 
-        self.model = Seq2One(input_size=len(INPUT_FEATURES))
-        self.model.load_state_dict(torch.load(model_path))
-        self.model.eval()
+            # Check if files exist
+            if not os.path.exists(scaler_path):
+                self.get_logger().error(f"Scaler file not found at: {scaler_path}")
+                raise FileNotFoundError(f"Scaler file not found at: {scaler_path}")
+
+            if not os.path.exists(model_path):
+                self.get_logger().error(f"Model file not found at: {model_path}")
+                raise FileNotFoundError(f"Model file not found at: {model_path}")
+
+            with open(scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+                self.get_logger().info("Successfully loaded scaler")
+
+            self.model = Seq2One(input_size=len(INPUT_FEATURES))
+            self.model.load_state_dict(torch.load(model_path))
+            self.model.eval()
+            self.get_logger().info("Successfully loaded model")
+        except Exception as e:
+            self.get_logger().error(f"Error loading model or scaler: {str(e)}")
+            raise
 
         # Latest robot state
         self.latest_state = {key: 0.0 for key in INPUT_FEATURES}
@@ -82,18 +101,46 @@ class RNNPredictorNode(Node):
         self.latest_state['cmd_ang_z'] = msg.angular.z
 
     def push_and_predict(self):
-        input_vector = [self.latest_state[key] for key in INPUT_FEATURES]
-        self.buffer.append(input_vector)
+        try:
+            # Add current state to buffer
+            input_vector = [self.latest_state[key] for key in INPUT_FEATURES]
+            self.buffer.append(input_vector)
 
-        self.get_logger().info(f"[DEBUG] Buffer size: {len(self.buffer)}")
+            # Log buffer status
+            if len(self.buffer) < SEQ_LEN:
+                self.get_logger().debug(f"Buffer filling: {len(self.buffer)}/{SEQ_LEN}")
+                return  # Not enough data yet
 
-        if len(self.buffer) == SEQ_LEN:
+            # Process input data
             input_array = np.array(self.buffer).reshape(1, SEQ_LEN, len(INPUT_FEATURES))
-            input_scaled = self.scaler.transform(input_array[0])
-            input_tensor = torch.tensor(input_scaled, dtype=torch.float32).unsqueeze(0)
 
-            with torch.no_grad():
-                prediction = self.model(input_tensor).numpy()[0]
+            # Scale input data
+            try:
+                input_scaled = self.scaler.transform(input_array[0])
+                input_tensor = torch.tensor(input_scaled, dtype=torch.float32).unsqueeze(0)
+            except Exception as e:
+                self.get_logger().error(f"Error scaling input data: {str(e)}")
+                return
+
+            # Run model inference
+            try:
+                with torch.no_grad():
+                    scaled_prediction = self.model(input_tensor).numpy()[0]
+
+                # Apply inverse transform to get actual position values
+                # Create a dummy array with zeros for all features except x,y (which we're predicting)
+                dummy_scaled_data = np.zeros((1, len(INPUT_FEATURES) + len(['x', 'y'])))
+                # The last two columns are x,y predictions
+                dummy_scaled_data[0, -2:] = scaled_prediction
+
+                # Apply inverse_transform to get the actual values
+                dummy_unscaled_data = self.scaler.inverse_transform(dummy_scaled_data)
+                # Extract the x,y predictions (last two columns)
+                prediction = dummy_unscaled_data[0, -2:]
+
+            except Exception as e:
+                self.get_logger().error(f"Error during model inference: {str(e)}")
+                return
 
             # Log prediction
             self.get_logger().info(
@@ -110,6 +157,10 @@ class RNNPredictorNode(Node):
             pose.pose.orientation.w = 1.0  # No rotation
 
             self.pred_pub.publish(pose)
+
+        except Exception as e:
+            self.get_logger().error(f"Unexpected error in push_and_predict: {str(e)}")
+            # Continue execution despite errors
 
 # === ROS2 Entry Point ===
 def main(args=None):
